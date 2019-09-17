@@ -16,6 +16,8 @@ type (
 	Monitor struct {
 		db      *pg.DB
 		address string
+		LastBlock int64
+		ConsecutiveBlocks uint8
 	}
 )
 
@@ -48,10 +50,10 @@ func main() {
 	defer db.Close()
 
 	// Start the monitor
-	monitor := &Monitor{db, os.Getenv("ADDRESS")}
+	monitor := &Monitor{db, os.Getenv("ADDRESS"), int64(0), uint8(0)}
 
 	go func() {
-		for range time.Tick(time.Second) {
+		for range time.Tick(30*time.Second) {
 			fmt.Println("start - alerting on misses")
 			err := monitor.AlertMisses()
 			if err != nil {
@@ -60,17 +62,6 @@ func main() {
 			fmt.Println("finish - alerting on misses")
 		}
 	}()
-	go func() {
-		for range time.Tick(time.Second) {
-			fmt.Println("start - alerting on governance")
-			err := monitor.AlertGovernance()
-			if err != nil {
-				fmt.Printf("error - alerting on governance: %v\n", err)
-			}
-			fmt.Println("finish - alerting on governance")
-		}
-	}()
-
 	// Allow graceful closing of the process
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, os.Interrupt)
@@ -81,14 +72,25 @@ func main() {
 func (m *Monitor) AlertMisses() error {
 	// Query block misses from the DB
 	var misses []*types.MissInfo
-	err := m.db.Model(&types.MissInfo{}).Where("alerted = FALSE and address = ?", m.address).Select(&misses)
+	err := m.db.Model(&types.MissInfo{}).Where("alerted = FALSE and address = ?", m.address).Order("height ASC").Select(&misses)
 	if err != nil {
 		return err
 	}
 
 	// Iterate misses and send alerts
 	for _, miss := range misses {
-		raven.CaptureMessage("Missed block", map[string]string{"height": strconv.FormatInt(miss.Height, 10), "time": miss.Time.String(), "address": miss.Address})
+		if(miss.Height == m.LastBlock +  1) {
+			m.ConsecutiveBlocks += 1
+			fmt.Println("ConsecutiveBlocks", m.ConsecutiveBlocks)
+		} else {
+			m.ConsecutiveBlocks = 0
+		}
+		m.LastBlock = miss.Height
+
+		if(m.ConsecutiveBlocks >= 10) {
+			raven.CaptureMessage("Missed blocks", map[string]string{"height": strconv.FormatInt(miss.Height, 10), "time": miss.Time.String(), "address": miss.Address})
+			m.ConsecutiveBlocks = 0
+		}
 
 		// Mark miss as alerted in the db
 		miss.Alerted = true
@@ -96,40 +98,7 @@ func (m *Monitor) AlertMisses() error {
 		if err != nil {
 			return err
 		}
-
-		fmt.Printf("alerted on miss #height: %d\n", miss.Height)
-	}
-
-	return nil
-}
-
-// AlertGovernance queries active governance proposals from the database and sends the relevant alert to sentry
-func (m *Monitor) AlertGovernance() error {
-	// Query proposals from the DB
-	var proposals []*types.Proposal
-	err := m.db.Model(&types.Proposal{}).
-		Where("alerted = FALSE and proposal_status = ?", "Active").
-		Select(&proposals)
-	if err != nil {
-		return err
-	}
-
-	// Send alerts for every proposal
-	for _, proposal := range proposals {
-		raven.CaptureMessage(fmt.Sprintf("New governance proposal: %s\nDescription: %s\nStartHeight: %s", proposal.Title, proposal.Description, proposal.VotingStartBlock),
-			map[string]string{
-				"height": strconv.FormatInt(proposal.Height, 10),
-				"type":   proposal.Type,
-			})
-
-		// Mark proposal as alerted in the db
-		proposal.Alerted = true
-		_, err = m.db.Model(proposal).Where("id = ?", proposal.ID).Update()
-		if err != nil {
-			return err
-		}
-
-		fmt.Printf("alerted on proposal #%s\n", proposal.ID)
+		fmt.Printf("Processed miss #height: %d\n", miss.Height)
 	}
 
 	return nil
